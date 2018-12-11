@@ -1,0 +1,203 @@
+---
+title: "R Notebook: Analyze microbiome data from https://www.ncbi.nlm.nih.gov/bioproject/PRJEB14536/ "
+output: html_notebook
+---
+
+This script follows the dada2 protocol from this link: https://benjjneb.github.io/dada2/tutorial.html
+
+# Load library
+```{r}
+# if (!requireNamespace("BiocManager", quietly = TRUE))
+#     install.packages("BiocManager")
+# BiocManager::install("dada2", version = "3.8")
+library(dada2)
+library(tidyverse)
+library(phyloseq)
+```
+
+
+# Get path of the fastq files
+```{r}
+path <- "fastq_data" 
+ list.files(path)
+```
+
+
+
+```{r}
+# Forward and reverse fastq filenames have format: SAMPLENAME_R1_001.fastq and SAMPLENAME_R2_001.fastq
+fnFs <- sort(list.files(path, pattern="_1.fastq", full.names = TRUE))
+fnRs <- sort(list.files(path, pattern="_2.fastq", full.names = TRUE))
+# Extract sample names, assuming filenames have format: SAMPLENAME_XXX.fastq
+sample.names <- sapply(strsplit(basename(fnFs), "_"), `[`, 1)
+```
+
+
+# Plot quality profile of first 2 samples in "forward" end
+```{r}
+plotQualityProfile(fnFs[1:2])
+```
+
+# Plot quality profile of first 2 samples in "reverse" end
+```{r}
+plotQualityProfile(fnRs[1:2])
+```
+
+
+
+```{r}
+# Place filtered files in filtered/ subdirectory
+filtFs <- file.path(path, "filtered", paste0(sample.names, "_F_filt.fastq.gz"))
+filtRs <- file.path(path, "filtered", paste0(sample.names, "_R_filt.fastq.gz"))
+```
+
+
+
+# Filter and trim reads
+```{r}
+out <- filterAndTrim(fnFs, filtFs, fnRs, filtRs, truncLen=c(320,260),
+              maxN=0, maxEE=c(3,3), truncQ=2, rm.phix=TRUE,
+              compress=TRUE, multithread=TRUE) # On Windows set multithread=FALSE
+head(out)
+```
+
+# Learn error rates in forward end
+```{r}
+errF <- learnErrors(filtFs, multithread=TRUE)
+```
+
+# Learn error rates in reverse end
+```{r}
+errR <- learnErrors(filtRs, multithread=TRUE)
+```
+
+
+```{r}
+plotErrors(errF, nominalQ=TRUE)
+```
+
+
+# Dereplicate the reads
+```{r}
+derepFs <- derepFastq(filtFs, verbose=TRUE)
+derepRs <- derepFastq(filtRs, verbose=TRUE)
+# Name the derep-class objects by the sample names
+names(derepFs) <- sample.names
+names(derepRs) <- sample.names
+```
+
+
+# Remove errors from the forward reads
+```{r}
+dadaFs <- dada(derepFs, err=errF, multithread=TRUE)
+```
+
+
+Remove errors from the reverse reads
+```{r}
+dadaRs <- dada(derepRs, err=errR, multithread=TRUE)
+```
+
+
+# dada-class object
+```{r}
+dadaFs[[1]]
+```
+
+
+# Merge forward and reverse reads
+```{r}
+mergers <- mergePairs(dadaFs, derepFs, dadaRs, derepRs, verbose=TRUE)
+# Inspect the merger data.frame from the first sample
+head(mergers[[1]])
+```
+
+# Amplicon sequence variant table (ASV)
+```{r}
+seqtab <- makeSequenceTable(mergers)
+dim(seqtab)
+```
+
+
+# Remove chimeras 
+```{r}
+seqtab.nochim <- removeBimeraDenovo(seqtab, method="consensus", multithread=TRUE, verbose=TRUE)
+dim(seqtab.nochim)
+```
+
+```{r}
+sum(seqtab.nochim)/sum(seqtab)
+```
+
+
+# Function to see how the reads fared through the pipeline
+```{r}
+getN <- function(x) sum(getUniques(x))
+track <- cbind(out, sapply(dadaFs, getN), sapply(dadaRs, getN), sapply(mergers, getN), rowSums(seqtab.nochim))
+# If processing a single sample, remove the sapply calls: e.g. replace sapply(dadaFs, getN) with getN(dadaFs)
+colnames(track) <- c("input", "filtered", "denoisedF", "denoisedR", "merged", "nonchim")
+rownames(track) <- sample.names
+summary(track)
+```
+
+
+
+# Assign taxonomy using Silva database v132
+https://zenodo.org/record/1172783
+
+```{r}
+taxa <- assignTaxonomy(seqtab.nochim, "silva_nr_v132_train_set.fa.gz", multithread=TRUE)
+```
+
+# Assign species label to the reads using Silva database v132
+```{r}
+taxa_species <- addSpecies(taxa, "silva_species_assignment_v132.fa.gz")
+```
+
+# Load sample dataframe
+```{r}
+samdf <- read_tsv("SraRunTable.txt") %>%
+          mutate("sample_name"=Run) %>%
+   select("Run","sample_name","environment_biome","host_sex","sample_type") %>%
+  column_to_rownames("Run")
+```
+
+# Create phyloseq object from the dada2 output
+```{r}
+
+ps <- phyloseq(otu_table(seqtab.nochim, taxa_are_rows=FALSE), 
+               sample_data(samdf), 
+               tax_table(taxa_species))
+```
+
+# Save R objects
+```{r}
+save(seqtab,file="seqtab.Rdata")
+save(ps, file="ps.Rdata")
+save(taxa_species,file="taxa_species.Rdata")
+save(seqtab.nochim,file="seqtab.nochim.Rdata")
+save(samdf,file="samdf.Rdata")
+```
+
+
+# Plot alpha-diversity 
+```{r}
+plot_richness(ps, x="sample_type", measures=c("Shannon", "Simpson"), color="host_sex")
+```
+
+```{r}
+ps.prop <- transform_sample_counts(ps, function(otu) otu/sum(otu))
+ord.nmds.bray <- ordinate(ps.prop, method="NMDS", distance="bray")
+plot_ordination(ps.prop, ord.nmds.bray, color="environment_biome", title="Bray NMDS")
+```
+
+
+```{r}
+top20 <- names(sort(taxa_sums(ps), decreasing=TRUE))[1:20]
+ps.top20 <- transform_sample_counts(ps, function(OTU) OTU/sum(OTU))
+ps.top20 <- prune_taxa(top20, ps.top20)
+plot_bar(ps.top20, x="sample_type", fill="Order") + facet_wrap(~environment_biome, scales="free_x")
+```
+
+
+
